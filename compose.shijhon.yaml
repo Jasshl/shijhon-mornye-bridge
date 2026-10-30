@@ -1,0 +1,25 @@
+# Start Shijhon's packaging/compose.yaml stack first (project name: shijhon).
+name: shijhon-mornye-bridge
+services:
+  mornye-bridge:
+    build: .
+    image: shijhon-mornye-bridge:local
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+    ports:
+      - "127.0.0.1:4760:4760"
+    volumes:
+      - bridge-state:/state
+      # Optional: copy packaging/docker.toml, edit it, and mount your file here.
+      # - ./config.toml:/etc/mornye-bridge/config.toml:ro
+    networks: [shijhon]
+networks:
+  shijhon:
+    external: true
+    name: ${SHIJHON_NETWORK:-shijhon_default}
+volumes:
+  bridge-state:

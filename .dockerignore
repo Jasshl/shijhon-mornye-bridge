@@ -1,0 +1,14 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!src/**
+!tools/
+!tools/build-host.sh
+!packaging/
+!packaging/docker.toml
+**/__pycache__
+**/*.pyc

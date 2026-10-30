@@ -1,0 +1,13 @@
+{% extends 'base.html' %}{% from 'macros.html' import csrf_field %}
+{% block title %}{% if configured %}Log in{% else %}Choose a password{% endif %} · Extension bridge{% endblock %}
+{% block content %}<section class="login card"><p class="eyebrow">Private management</p>
+<h1>{% if configured %}Manage your extensions{% else %}Choose a password{% endif %}</h1>
+{% if configured %}<p class="muted">Log in with the bridge's management password.</p>
+{% else %}<p>Choose a password to manage your extensions.</p>
+<p class="muted">Until a password is chosen, whoever reaches this page first sets it. Keep this page private.</p>{% endif %}
+<form method="post" action="/login">{{ csrf_field(csrf) }}
+<label for="password">{% if configured %}Password{% else %}New password{% endif %}</label>
+<input id="password" name="password" type="password" autocomplete="{% if configured %}current-password{% else %}new-password{% endif %}" required autofocus maxlength="1024">
+{% if not configured %}<small>Use any non-empty password, up to 1024 characters. Keep it private.</small>{% endif %}
+{% if error %}<p role="alert" class="error">{{ error }}</p>{% endif %}
+<button>{% if configured %}Log in{% else %}Save password{% endif %}</button></form></section>{% endblock %}

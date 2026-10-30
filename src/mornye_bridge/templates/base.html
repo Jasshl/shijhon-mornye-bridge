@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Extension bridge{% endblock %}</title><link rel="stylesheet" href="/assets/web.css"><script src="/assets/web.js" defer></script></head>
+<body><a class="skip" href="#main">Skip to content</a><header><a class="brand" href="/">Extension bridge<span>for Shijhon</span></a>
+{% if session.authenticated %}<nav aria-label="Main"><a href="/#extensions">Extensions</a><a href="/#registries">Registries</a><a href="/links">Use in Shijhon</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="quiet">Log out</button></form></nav>{% endif %}</header>
+<main id="main">{% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}{% block content %}{% endblock %}</main><footer>Private management · Native extensions provide catalog and audio behavior.</footer></body></html>

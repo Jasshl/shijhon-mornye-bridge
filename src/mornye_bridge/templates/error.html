@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<section class="card"><h1>Could not complete that step</h1><p role="alert">{{ code | replace('_', ' ') | capitalize }}.</p><p>Submitted credentials are not shown. Return to the page and try again.</p><a class="button secondary" href="{{ '/' if authenticated else '/login' }}">Return to management</a></section>{% endblock %}

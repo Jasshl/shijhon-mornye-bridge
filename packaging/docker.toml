@@ -1,0 +1,7 @@
+library = "/opt/mornye/libmornye_desktop.so"
+state_dir = "/state"
+host = "0.0.0.0"
+port = 4759
+public_url = "http://mornye-bridge:4759"
+management_host = "0.0.0.0"
+management_port = 4760

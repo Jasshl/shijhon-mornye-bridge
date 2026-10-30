@@ -1,0 +1,43 @@
+# Copy to config.toml (git-ignored) and set the absolute operator-built library path.
+library = "/absolute/path/libmornye_desktop.dylib"
+state_dir = "state"
+host = "127.0.0.1"
+port = 4759
+# Optional separate loopback management listener; API/audio alone stay on host:port.
+# management_host = "127.0.0.1"
+# management_port = 4760
+# Serve management at the root of its own host (no path prefixes).
+# management_public_url = "https://manage.example.test"
+# Trust only actual proxy connection IPs for forwarded scheme/client headers.
+# No addresses are trusted by default; FORWARDED_ALLOW_IPS is not used by serve.
+# management_trusted_proxies = ["127.0.0.1", "::1"]
+# Set this to the origin Shijhon can reach if it differs from the default loopback origin.
+public_url = "http://127.0.0.1:4759"
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+call_timeout = 135.0
+download_stall_timeout = 180.0
+download_timeout = 14400.0
+cancel_timeout = 10.0
+shutdown_timeout = 15.0
+download_backoff = 300.0
+admission = 8
+# Overall cap on files prepared at once; each extension also keeps to its own declared
+# limit (capabilities.downloadTransfer.maxConcurrentDownloads, 1-3, default 3).
+preparations = 6
+# Longest wait per stream request; unfinished work answers 503 with Retry-After: 2.
+stream_wait = 8.0
+cache_bytes = 2147483648
+cache_age = 604800.0
+
+# No registry is preconfigured. Page edits go to state_dir/settings.toml, overriding
+# these base values without writing this file (read-only Nix store configs are supported).
+# Add only registry addresses you trust.
+# registries = []
+
+# Optional catalog identities. Defaults: extension id reduced to letters/digits,
+# empty region, client_artwork=true. Confirm the declared identity in Shijhon.
+# [catalogs.example]
+# key = "examplemusic"
+# region = "us"
+# client_artwork = true
