@@ -1,6 +1,6 @@
 [project]
 name = "shijhon-mornye-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Isolated Mornye extension host bridge for Shijhon"
 license = "MIT"
 license-files = ["LICENSE"]

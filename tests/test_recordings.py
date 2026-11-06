@@ -308,11 +308,11 @@ async def test_native_ids_are_prepared_from_their_details(config, tmp_path):
         worker.reported = {}
         entry = await service.stream(ext, encode_id("second"), "native-aac")
         assert "isrc" not in entry.metadata and "explicit" not in entry.metadata
-        # Another reported ISRC is another recording.
+        # Another reported ISRC alone is no mismatch: the length decides, and the
+        # catalog's version is not kept for a file under another ISRC.
         worker.reported = {"isrc": "ZZABC2600099"}
-        with pytest.raises(BridgeError) as failure:
-            await service.stream(ext, encode_id("third"), "native-aac")
-        assert failure.value.code == "different_recording_isrc"
+        entry = await service.stream(ext, encode_id("third"), "native-aac")
+        assert entry.metadata["isrc"] == "ZZABC2600099" and "explicit" not in entry.metadata
         # A track without an artist cannot be looked up.
         downloads = len(worker.downloads)
         with pytest.raises(BridgeError) as failure:
@@ -448,10 +448,10 @@ async def test_prepared_recordings_are_verified_before_publication(config, caplo
             downloads = len(worker.downloads)
             assert (await stream(WANTED | {"durationMs": "8000"})).status_code == 404
             assert len(worker.downloads) == downloads  # remembered
-            # A reported ISRC that differs is another recording.
+            # A reported ISRC that differs alone is no mismatch: the length decides.
             worker.reported = {"isrc": "ZZABC2600010"}
             reply = await stream(WANTED | {"title": "Second Tune"})
-            assert reply.json() == {"error": "different_recording_isrc"}
+            assert reply.status_code == 200
             # Without a wanted length only the wanted ISRC, reported, will do.
             worker.reported = {}
             reply = await stream(WANTED | {"title": "Third Tune", "durationMs": "0"})
@@ -460,7 +460,9 @@ async def test_prepared_recordings_are_verified_before_publication(config, caplo
             worker.reported = {"isrc": "ZZABC2600011", "explicit": True}
             wanted = {"title": "Fourth Tune", "artist": "Invented Band", "durationMs": "2500"}
             assert (await stream(wanted)).status_code == 200
-            [entry] = service.cache.entries("invented")
+            [entry] = [
+                e for e in service.cache.entries("invented") if e.metadata["title"] == "Fourth Tune"
+            ]
             assert entry.metadata["durationMs"] == 1000
             assert entry.metadata["isrc"] == "ZZABC2600011"
             assert entry.metadata["explicit"] is True

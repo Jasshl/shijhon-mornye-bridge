@@ -20,7 +20,7 @@ Install the bridge from its release tag, then build the pinned host from upstrea
 source in a separate private directory:
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/Jasshl/shijhon-mornye-bridge.git
+git clone --branch v0.1.1 --depth 1 https://github.com/Jasshl/shijhon-mornye-bridge.git
 cd shijhon-mornye-bridge
 uv sync --locked
 ./tools/build-host.sh /absolute/private/build-directory

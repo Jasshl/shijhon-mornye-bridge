@@ -12,7 +12,7 @@ catalog, formats, login and download behavior. No registry is preconfigured.
 Start Shijhon's Compose stack, then build and start the bridge from this checkout:
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/Jasshl/shijhon-mornye-bridge.git
+git clone --branch v0.1.1 --depth 1 https://github.com/Jasshl/shijhon-mornye-bridge.git
 cd shijhon-mornye-bridge
 docker compose -f compose.shijhon.yaml build
 docker compose -f compose.shijhon.yaml up -d

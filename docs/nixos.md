@@ -7,7 +7,7 @@ binary or image is published.
 Add the release to your system flake's inputs and import its module:
 
 ```nix
-inputs.mornye-bridge.url = "github:Jasshl/shijhon-mornye-bridge/v0.1.0";
+inputs.mornye-bridge.url = "github:Jasshl/shijhon-mornye-bridge/v0.1.1";
 
 # In a NixOS module with inputs passed via specialArgs:
 imports = [ inputs.mornye-bridge.nixosModules.default ];

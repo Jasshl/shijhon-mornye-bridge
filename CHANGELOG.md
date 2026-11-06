@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Accept a prepared file whose reported ISRC differs from the wanted song's when its
+  length matches, as Shijhon's matching does: the same recording is often released
+  under several ISRCs. Such files are no longer discarded as `different_recording_isrc`.
+
 ## 0.1.0
 
 - Expose installed Mornye extensions as Shijhon add-ons for audio, catalog data or

@@ -78,11 +78,11 @@ With an empty source the pinned planner skips metadata enrichment. It runs the
 extension's preflight and `checkAvailability`, downloads the found track with its
 prepared context and checks the file against the ISRC or title, artist and length
 (within 10 s). Shijhon's rules are stricter, so before publishing the bridge checks the
-completed file again: the probed length must be within 3 s of the wanted length; an
-ISRC the result reports that differs from the wanted one is another recording; with
+completed file again: the probed length must be within 3 s of the wanted length; with
 no wanted or probed length, only the wanted ISRC reported by the result will do. A
-mismatch discards the file and is a recording miss (404 `different_recording_length`,
-`different_recording_isrc` or `unverified_recording`, remembered). Shijhon sends no
+different reported ISRC alone is no mismatch, as in Shijhon's matching: one recording
+is often released under several. A mismatch discards the file and is a recording miss
+(404 `different_recording_length` or `unverified_recording`, remembered). Shijhon sends no
 version to `resolve` or `availability`, so there is no wanted version to compare.
 Published metadata is the wanted title, artist and album with the probed length, the
 ISRC only as the result reports it, and `explicit: true` when the result says so. The

@@ -166,13 +166,12 @@ def verified_track(
 ) -> dict[str, Any]:
     """The prepared file's metadata, checked against the wanted recording by Shijhon's
     rules: a probed length within 3 s, or without a wanted or probed length the wanted
-    ISRC reported by the result; a different reported ISRC is another recording. A
-    mismatch is a recording miss (404)."""
+    ISRC reported by the result. A different reported ISRC alone is no mismatch (the same
+    recording is often released under several), as in Shijhon's matching. A mismatch is a
+    recording miss (404)."""
     isrc, title, artist, duration, album = recording
     reported = "".join(ch for ch in text(result.get("isrc")) if ch.isascii() and ch.isalnum())
     reported = reported.upper() if len(reported) == 12 else ""
-    if isrc and reported and reported != isrc:
-        raise BridgeError("different_recording_isrc", 404)
     probed = audio.get("duration")
     length = round(probed * 1000) if isinstance(probed, (int, float)) and probed > 0 else 0
     if duration and length:
