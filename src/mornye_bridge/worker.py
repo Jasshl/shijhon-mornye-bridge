@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from typing import Any
 
@@ -63,7 +64,17 @@ async def run() -> None:
             host.cancel(native_id)
 
 
+def ignore_stop(signum: int, frame: Any) -> None:
+    """Leave the worker's lifetime to the supervisor."""
+
+
 def main() -> None:
+    # The supervisor owns this process and stops it by killing its process group. A stop
+    # signal sent to every process of the service (systemd's control-group kill) must not
+    # end a native call, such as an upgrade, before the supervisor decides to. A no-op
+    # handler, not SIG_IGN: an ignored signal stays ignored in programs this process
+    # starts (FFmpeg), a handled one is reset to the default for them.
+    signal.signal(signal.SIGTERM, ignore_stop)
     try:
         asyncio.run(run())
     finally:

@@ -151,6 +151,7 @@ async def serve_separate(config: Config) -> None:
 
     service = Service(config)
     await service.start()
+    service.start_maintenance()
     servers = [
         Listener(
             uvicorn.Config(
@@ -171,6 +172,7 @@ async def serve_separate(config: Config) -> None:
     loop = asyncio.get_running_loop()
 
     def stop() -> None:
+        service.begin_shutdown()
         for server in servers:
             server.should_exit = True
 
@@ -214,16 +216,26 @@ def main() -> None:
             if config.management_host:
                 asyncio.run(serve_separate(config))
                 return
+            service = Service(config)
+
+            class Server(uvicorn.Server):
+                def handle_exit(self, sig: int, frame: Any) -> None:
+                    # Shutdown begins at the signal: no renewal starts from here on.
+                    service.begin_shutdown()
+                    super().handle_exit(sig, frame)
+
             # No access logs: path prefixes, selectors and query strings are credentials.
-            uvicorn.run(
-                create_app(Service(config)),
-                host=config.host,
-                port=config.port,
-                access_log=False,
-                proxy_headers=False,
-                log_level="critical",
-                timeout_graceful_shutdown=int(config.shutdown_timeout),
-            )
+            Server(
+                uvicorn.Config(
+                    create_app(service),
+                    host=config.host,
+                    port=config.port,
+                    access_log=False,
+                    proxy_headers=False,
+                    log_level="critical",
+                    timeout_graceful_shutdown=int(config.shutdown_timeout),
+                )
+            ).run()
             return
         result = asyncio.run(execute(args, config))
         if args.private_output:

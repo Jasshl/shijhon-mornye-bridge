@@ -11,6 +11,10 @@ Operations are CLI names, with `registry.get/set`, `settings.show/set`, and
 `private:true` request returns private auth/action results or add-on links. Do not log
 requests/responses. Add-on access tokens grant no management access. Mutations serialize;
 disable/remove/update cancel that extension's preparation before changing it.
+`auto-update` (with `extension` and `registry`) is the automatic update: it downloads the
+offered package, installs it only when it keeps the extension's sign-in or the extension
+already needs signing in, and refuses while that extension prepares a file. For an
+extension with a signed session, `pending-auth.show` also confirms a usable session.
 
 Add-on endpoints live at `/addons/<access.token>/<extension-id>/...`:
 
@@ -54,7 +58,7 @@ fields are left out; the bridge has none to send. Only `available: true` counts;
 `track_id` and `prepared_context` are opaque and not kept, because the download asks
 again. `available: false` (or no answer) is read with the rules for native errors
 (its `error_type` or `code`, else its `reason`): a login or verification need answers
-503 without Retry-After and marks the extension's login status, a rate limit answers
+503 `needs_sign_in` without Retry-After and marks the extension's login status, a rate limit answers
 429; neither is remembered. Anything else is absence: 404. Found and absent answers
 are remembered per extension and recording: found for 10 minutes, absent for 5
 minutes (at most 2,048), and cleared with the miss memory. A recording already in the cache
@@ -212,8 +216,15 @@ are bounded. Crashes, malformed result pipes and unanswered deadlines recover th
 a fresh worker on the next call, without replaying mutations. Cancellation uses C
 call IDs and native item cancellation, drains the reply or kills the worker process
 group before staging cleanup. Native stderr and log events are discarded, not retained
-as plaintext. Native errors become fixed public codes. Needs-login/verification is
-503; API rate limits are 429/Retry-After; audio delivery never returns a rate-limit 429.
+as plaintext. Native errors become fixed public codes. API rate limits are
+429/Retry-After; audio delivery never returns a rate-limit 429.
+
+When an extension needs login or verification, the add-on routes and `/audio/` answer
+503 with `Cache-Control: no-store` and the JSON body
+`{"error": "needs_sign_in", "url": "<management origin>/sign-in"}`, as Shijhon's add-on
+protocol asks: the operator signs in on the bridge's own sign-in page. `url` is
+`management_public_url` followed by `/sign-in`, a plain address without any token, and
+is left out when `management_public_url` is not configured.
 
 Prepared files are probed and atomically moved into a persistent size/age/LRU cache.
 Active file responses hold eviction leases; an evicted link can fail before a client

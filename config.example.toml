@@ -35,6 +35,19 @@ cache_age = 604800.0
 # Add only registry addresses you trust.
 # registries = []
 
+# Install registry updates that keep each extension's sign-in once a day; updates that
+# would sign an extension out wait until it needs signing in anyway. Page edits override it.
+# auto_update = true
+# Also install updates that would sign an extension out (off by default).
+# update_all = false
+# One single-result catalog search shortly before a signed session expires, so the host
+# renews it while the extension is idle.
+# keep_alive = true
+# With keep_alive on: when an extension's searches do not renew its session, start
+# preparing the last song it delivered once in the last hour before expiry, and cancel
+# it when the session is renewed or the audio transfer begins (some audio may arrive).
+# renew_by_download = true
+
 # Optional catalog identities. Defaults: extension id reduced to letters/digits,
 # empty region, client_artwork=true. Confirm the declared identity in Shijhon.
 # [catalogs.example]

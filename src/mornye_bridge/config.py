@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import os
 import secrets
 import tempfile
@@ -14,6 +15,15 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, PrivateAttr, fiel
 
 HOST_COMMIT = "c90ec6478ad3e808ef22ba9464f8ad05054dde7b"
 HOST_VERSION = "5.2.6"
+# Settings the management page saves to state_dir/settings.toml.
+OVERLAY_KEYS = {
+    "registries",
+    "catalogs",
+    "auto_update",
+    "update_all",
+    "keep_alive",
+    "renew_by_download",
+}
 
 
 class CatalogConfig(BaseModel):
@@ -55,6 +65,18 @@ class Config(BaseModel):
     cache_bytes: int = Field(default=2 * 1024**3, gt=0)
     cache_age: float = Field(default=7 * 86400, gt=0)
     registries: list[str] | None = None
+    # Install registry updates that keep each extension's sign-in; updates that would
+    # sign an extension out wait until it needs signing in anyway.
+    auto_update: bool = True
+    # With automatic updates on, also install updates that would sign an extension out.
+    update_all: bool = False
+    # Make one small signed request inside a signed session's renewal window, so the host
+    # renews it while the extension is idle.
+    keep_alive: bool = True
+    # With keep_alive on, for extensions whose searches do not renew their session: once
+    # in the last hour before it expires, start preparing the last song the extension
+    # delivered and cancel it when the session is renewed or the audio transfer begins.
+    renew_by_download: bool = True
     _path: Path | None = PrivateAttr(default=None)
     catalogs: dict[str, CatalogConfig] = Field(default_factory=dict)
 
@@ -96,7 +118,7 @@ class Config(BaseModel):
         overrides = config.state_dir / "settings.toml"
         if overrides.exists():
             saved = tomllib.loads(overrides.read_text())
-            if set(saved) - {"registries", "catalogs"}:
+            if set(saved) - OVERLAY_KEYS:
                 raise ValueError("unsupported saved setting")
             config = cls.model_validate(config.model_dump() | saved)
         config._path = path.resolve()
@@ -104,7 +126,7 @@ class Config(BaseModel):
 
     def persist(self, **changes: Any) -> None:
         # Page state overlays declarative configuration (which may live in the Nix store).
-        if set(changes) - {"registries", "catalogs"}:
+        if set(changes) - OVERLAY_KEYS:
             raise ValueError("unsupported saved setting")
         validated = self.model_validate(self.model_dump() | changes)
         path = self.state_dir / "settings.toml"
@@ -151,6 +173,19 @@ class Config(BaseModel):
             "ffmpeg": self.ffmpeg,
             "ffprobe": self.ffprobe,
         }
+
+
+def write_private_json(path: Path, value: Any) -> None:
+    """Replace a small state file atomically, readable by the service user only."""
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.stem + "-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def secret_file(path: Path, initial: str) -> str:

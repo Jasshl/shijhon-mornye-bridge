@@ -352,10 +352,10 @@ def test_serve_disables_implicit_uvicorn_proxy_trust(tmp_path, monkeypatch):
     monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
     options = {}
 
-    def serve(app, **kwargs):
-        options.update(kwargs)
+    def serve(server):
+        options.update(vars(server.config))
 
-    monkeypatch.setattr("mornye_bridge.cli.uvicorn.run", serve)
+    monkeypatch.setattr("mornye_bridge.cli.uvicorn.Server.run", serve)
     main()
     assert options["proxy_headers"] is False
     assert options["host"] == "127.0.0.1" and options["access_log"] is False

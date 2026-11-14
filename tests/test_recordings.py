@@ -495,7 +495,9 @@ async def test_resolve_keeps_login_and_rate_limits_apart_from_absence(config, an
                 assert reply.status_code == status
             assert len(worker.checks) == 2 and not service.resolved
             if status == 503:
-                assert reply.json() == {"error": "needs_login_or_verification"}
+                # Without a configured management origin there is no sign-in address.
+                assert reply.json() == {"error": "needs_sign_in"}
+                assert reply.headers["cache-control"] == "no-store"
                 assert "retry-after" not in reply.headers
                 assert service.management.states["invented"] == "needs_login_or_verification"
             else:

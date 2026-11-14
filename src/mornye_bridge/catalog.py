@@ -25,6 +25,19 @@ def number(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
 
 
+def _credited(artist_id: str, credit: str) -> list[dict[str, str]]:
+    """The artists of a display credit the contract gives with its artist id. Some
+    extensions join the ids of several artists with commas ("1,2") beside a credit that
+    joins their names with ", ": each artist named, when there are as many names as ids.
+    Otherwise the reference alone, never the credit as one artist's name (it may join
+    several artists, or be one name with a comma in it)."""
+    ids = [part for part in artist_id.split(",") if part]
+    names = credit.split(", ") if credit else []
+    if len(ids) >= 2 and len(names) == len(ids) and all(n.strip() for n in names):
+        return [{"id": encode_id(i), "name": n} for i, n in zip(ids, names, strict=True)]
+    return [{"id": encode_id(artist_id)}]
+
+
 def _map_item(raw: dict[str, Any], kind: str) -> dict[str, Any]:
     result: dict[str, Any] = {"id": encode_id(str(raw["id"]))}
     result["name" if kind == "artist" else "title"] = text(raw.get("name") or raw.get("title"))
@@ -42,8 +55,7 @@ def _map_item(raw: dict[str, Any], kind: str) -> dict[str, Any]:
         ]
         result["artist"] = ", ".join(a["name"] for a in result["artists"])
     if "artists" not in result and raw.get("artist_id"):
-        # The contract supplies a single artist id alongside a display credit.
-        result["artists"] = [{"id": encode_id(str(raw["artist_id"])), "name": text(artists)}]
+        result["artists"] = _credited(str(raw["artist_id"]), text(artists))
     for source, target in (
         ("release_date", "releaseDate"),
         ("album_type", "kind"),

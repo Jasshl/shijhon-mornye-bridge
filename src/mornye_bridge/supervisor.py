@@ -14,6 +14,12 @@ from typing import Any, Protocol
 from .config import Config
 from .errors import BridgeError, native_error
 
+# Installing or upgrading loads and validates the new extension, which can take longer
+# than an ordinary call; a deadline restart in the middle would interrupt it. While one
+# runs, other calls' deadlines and unanswered cancellations do not restart the worker.
+INSTALL_TIMEOUT = 300.0
+INSTALL_METHODS = {"upgradeExtension", "loadExtensionFromPath"}
+
 
 class Worker(Protocol):
     async def call(self, method: str, args: Any = None) -> Any: ...
@@ -40,6 +46,13 @@ class Supervisor:
         self.healthy = False
         self.downloads: dict[str, tuple[float, dict[str, Any]]] = {}
         self.drainers: set[asyncio.Task[None]] = set()
+        self.installing = 0
+        # Download items whose unanswered cancellation must not restart the worker while
+        # other calls run (renewals), and when such a restart last happened anyway.
+        self.gentle: set[str] = set()
+        self.gentle_restart_at = 0.0
+        # Gentle items whose cancellation went unanswered and that wait for other calls.
+        self.gentle_waiting: set[str] = set()
 
     async def _ensure(self) -> asyncio.subprocess.Process:
         async with self.lock:
@@ -133,12 +146,61 @@ class Supervisor:
         self.readers.clear()
         self._fail_pending()
 
+    async def _unanswered(
+        self,
+        future: asyncio.Future[Any],
+        process: asyncio.subprocess.Process,
+        item_id: str = "",
+        ack: asyncio.Future[Any] | None = None,
+    ) -> None:
+        """Free a call that did not answer in time by restarting the worker, unless that
+        would interrupt other work: an install or upgrade in progress, or, for a gentle
+        item, the other calls in flight now (not later ones), for at most call_timeout.
+        Until then, wait for the call's own reply; the caller keeps its staging folder and
+        admission slot meanwhile."""
+        gentle = item_id in self.gentle
+        others = (
+            [f for f in self.pending.values() if f is not future and f is not ack and not f.done()]
+            if gentle
+            else []
+        )
+        deadline = time.monotonic() + self.config.call_timeout
+        if gentle:
+            self.gentle_waiting.add(item_id)
+        try:
+            while not future.done() and process.returncode is None:
+                others = [f for f in others if not f.done()]
+                if not self.installing and not (others and time.monotonic() < deadline):
+                    break
+                await asyncio.wait([future, *others], timeout=0.2)
+        finally:
+            self.gentle_waiting.discard(item_id)
+        if not future.done():
+            if gentle:
+                self.gentle_restart_at = time.monotonic()
+            await self.restart(process)
+
+    async def _drain_timeout(
+        self, future: asyncio.Future[Any], process: asyncio.subprocess.Process
+    ) -> None:
+        try:
+            await self._unanswered(future, process)
+        finally:
+            self.active -= 1
+            if future.done() and not future.cancelled():
+                future.exception()
+
     async def restart(self, process: asyncio.subprocess.Process) -> None:
         async with self.lock:
             if self.process is process:
                 self.restarts += 1
                 await self._stop()
         # Lazy restart: the next call starts a clean owner; never replay a mutation.
+
+    def progress(self, item_id: str) -> dict[str, Any] | None:
+        """The latest merged progress of a download in flight (status, stage, bytes)."""
+        entry = self.downloads.get(item_id)
+        return dict(entry[1]) if entry else None
 
     def _progress(self, event: dict[str, Any]) -> None:
         if event.get("kind") != 10:
@@ -186,6 +248,9 @@ class Supervisor:
         process: asyncio.subprocess.Process | None = None
         item_id = json.loads(args)["item_id"] if method == "downloadByStrategy" else ""
         deferred = False
+        installing = method in INSTALL_METHODS
+        if installing:
+            self.installing += 1
         try:
             process = await self._ensure()
             assert process.stdin is not None
@@ -205,9 +270,19 @@ class Supervisor:
                     raise BridgeError(
                         "download_timeout", retry_after=int(self.config.download_backoff)
                     ) from None
-            return await asyncio.wait_for(asyncio.shield(future), self.config.call_timeout)
+            deadline = self.config.call_timeout
+            if method in INSTALL_METHODS:
+                deadline = max(deadline, INSTALL_TIMEOUT)
+            return await asyncio.wait_for(asyncio.shield(future), deadline)
         except TimeoutError:
-            if process:
+            if process and future and not installing and self.installing:
+                # An upgrade runs: keep the slot until this call answers or the upgrade
+                # ends, without interrupting the upgrade.
+                deferred = True
+                task = asyncio.create_task(self._drain_timeout(future, process))
+                self.drainers.add(task)
+                task.add_done_callback(self.drainers.discard)
+            elif process:
                 await self.restart(process)
             raise BridgeError("worker_timeout") from None
         except asyncio.CancelledError:
@@ -226,6 +301,8 @@ class Supervisor:
                 await self.restart(process)
             raise BridgeError("worker_crashed") from None
         finally:
+            if installing:
+                self.installing -= 1
             self.downloads.pop(item_id, None)
             if not deferred:
                 self.active -= 1
@@ -261,6 +338,7 @@ class Supervisor:
         process: asyncio.subprocess.Process,
         item_id: str = "",
     ) -> None:
+        ack: asyncio.Future[Any] | None = None
         try:
             async with asyncio.timeout(self.config.cancel_timeout):
                 if process.stdin and process.returncode is None:
@@ -287,8 +365,10 @@ class Supervisor:
                     else:
                         await process.stdin.drain()
                         await asyncio.shield(future)
-        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+        except TimeoutError:
             # Missing cancellation reply is evidence of an unresponsive native call.
+            await self._unanswered(future, process, item_id, ack)
+        except (BrokenPipeError, ConnectionResetError):
             await self.restart(process)
         except BridgeError:
             pass

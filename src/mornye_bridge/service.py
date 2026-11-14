@@ -14,13 +14,14 @@ import time
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from . import config as host_config
 from .cache import Cache, Entry
 from .catalog import Catalog, map_item, text
-from .config import CatalogConfig, Config, secret_file
+from .config import CatalogConfig, Config, secret_file, write_private_json
 from .errors import BridgeError, native_error
 from .finalize import finalize
 from .ids import (
@@ -33,8 +34,23 @@ from .ids import (
     recording_id,
     reference_id,
 )
-from .management import Management
+from .management import (
+    NEEDS_AUTH,
+    Management,
+    has_action_form,
+    login_action,
+    result_browser_url,
+)
+from .sessions import parse_time, saved_session
 from .supervisor import Supervisor, Worker
+from .updates import (
+    PACKAGE_SUFFIXES,
+    host_accepts,
+    installed_manifest,
+    keeps_sign_in,
+    newer,
+    package_manifest,
+)
 
 # One line per preparation and per resolve: codes and timings, never titles, artists,
 # IDs, URLs, tokens or native message text.
@@ -67,6 +83,83 @@ TRACK_DEFAULTS: dict[str, Any] = {
     "album_type": "",
     "upc": "",
 }
+
+
+# Automatic sign-in: the first retry after a failed attempt waits ten minutes, doubling
+# up to six hours. An attempt that needs the operator is not repeated until a sign-in
+# works again.
+SIGN_IN_RETRY = 600.0
+SIGN_IN_RETRY_MAX = 21600.0
+# Signed sessions are checked locally by the host; an unusable one asks its gateway.
+SESSION_CHECK_SECONDS = 1800.0
+SESSION_CHECK_FIRST = 120.0
+UPDATE_CHECK_SECONDS = 86400.0
+UPDATE_CHECK_FIRST = 600.0
+# An extension still preparing files is updated on a later try.
+UPDATE_BUSY_RETRY = 1800.0
+CHECK_TIMEOUT = 60.0
+# Keep-alive: the host renews a signed session during a signed request made in the last
+# hour before it expires. One one-result catalog search is made about fifty minutes
+# before expiry, at most every twenty minutes per extension. When two such searches leave
+# the expiry unchanged, the extension's searches are not signed: that version is not
+# kept alive. Failed searches back off from thirty minutes up to six hours.
+KEEP_ALIVE_WINDOW = 3600.0
+KEEP_ALIVE_LEAD = 3000.0
+KEEP_ALIVE_LATEST = 120.0
+KEEP_ALIVE_SPACING = 1200.0
+KEEP_ALIVE_RETRY = 1800.0
+KEEP_ALIVE_MISSES = 2
+KEEP_ALIVE_QUERY = "music"
+SESSIONS_FILE = "sessions.json"
+# The pinned host an "unsupported" offer was judged against.
+HOST_ID = f"{host_config.HOST_COMMIT}/{host_config.HOST_VERSION}"
+UPDATES_FILE = "updates.json"
+DELIVERED_FILE = "delivered.json"
+# Renewal by a brief download: poll the session's expiry and the download's progress
+# this often, and stop the attempt after this long at most.
+RENEWAL_POLL = 0.1
+RENEWAL_LIMIT = 60.0
+RENEWAL_MISSES = 2
+# A renewal that failed before the host started its download is tried again inside the
+# window after this long, doubling up to KEEP_ALIVE_RETRY.
+RENEWAL_RETRY = 300.0
+# A renewal stopped this often in one window (preparations of its extension) gives up
+# that window.
+RENEWAL_STOPS = 3
+# Supervisor failures that happen before the host starts a download.
+NOT_STARTED = {
+    "worker_busy",
+    "worker_stopped",
+    "worker_start_failed",
+    "worker_crashed",
+    "worker_restarted",
+}
+# Host progress statuses that mean the audio transfer itself has begun.
+TRANSFER_STATUSES = {"downloading", "finalizing", "completed", "complete", "done"}
+
+
+class Claims:
+    """Extensions some operation is changing, counted: one operation finishing never
+    clears another's claim on the same extension."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def add(self, key: str) -> None:
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+    def discard(self, key: str) -> None:
+        count = self.counts.get(key, 0) - 1
+        if count > 0:
+            self.counts[key] = count
+        else:
+            self.counts.pop(key, None)
+
+    def clear(self) -> None:
+        self.counts.clear()
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.counts
 
 
 def quality_options(extension: dict[str, Any]) -> list[dict[str, Any]]:
@@ -119,6 +212,35 @@ def wanted_recording(wanted: Mapping[str, str]) -> Recording:
         raise BridgeError("invalid_recording", 400)
     isrc = "".join(ch for ch in wanted.get("isrc", "") if ch.isascii() and ch.isalnum()).upper()
     return (isrc if len(isrc) == 12 else "", title, artist, round(duration), album)
+
+
+def strategy_payload(
+    extension: str, directory: Path, quality: str, job_id: str, recording: Recording
+) -> dict[str, Any]:
+    """The host planner's request for a described recording: no source and no track ID,
+    so it asks the extension's checkAvailability and downloads what it found."""
+    isrc, title, artist, duration, album = recording
+    return {
+        "contract_version": 1,
+        "service": extension,
+        "download_provider": extension,
+        "output_dir": str(directory),
+        "filename_format": "audio",
+        "quality": quality,
+        "item_id": job_id,
+        "use_extensions": True,
+        "use_fallback": False,
+        "embed_metadata": False,
+        "embed_lyrics": False,
+        "post_processing_enabled": False,
+        "network_concurrency_limit": 3,
+        "source": "",
+        "track_name": title,
+        "artist_name": artist,
+        "album_name": album,
+        "duration_ms": duration,
+        "isrc": isrc,
+    }
 
 
 def recording_track(ident: str, recording: Recording) -> dict[str, Any]:
@@ -280,10 +402,43 @@ class Service:
         self.generations: dict[str, int] = {}
         self.disabled: set[str] = set()
         self.lock_file: BinaryIO | None = None
-        self.changing: set[str] = set()
+        self.changing = Claims()
         self.mutation_lock = asyncio.Lock()
         self.access_token = ""
         self.admin_token = ""
+        # Automatic sign-in per extension: earliest next attempt and failures in a row.
+        self.sign_in_next: dict[str, float] = {}
+        self.sign_in_failures: dict[str, int] = {}
+        self.sign_in_tasks: dict[str, asyncio.Task[None]] = {}
+        # Offered updates per extension: version, registry and state (available,
+        # waiting for a sign-in, busy, installed or failed).
+        self.updates: dict[str, dict[str, str]] = {}
+        self.update_lock = asyncio.Lock()
+        self.maintenance: list[asyncio.Task[Any]] = []
+        # Signed sessions per extension, saved in SESSIONS_FILE: last seen expiry and
+        # observed renewal (ISO times), and the version that no keep-alive renews.
+        self.sessions: dict[str, dict[str, Any]] = {}
+        # Keep-alive per extension (not saved): earliest next search, failed searches, and
+        # searches that left the expiry unchanged, counted per expiry (renewal window).
+        self.keep_alive_next: dict[str, float] = {}
+        self.keep_alive_misses: dict[str, tuple[str, int]] = {}
+        self.keep_alive_failures: dict[str, int] = {}
+        # The last recording each extension delivered (its description and format),
+        # saved in DELIVERED_FILE: what a brief renewal download asks for again.
+        self.delivered: dict[str, tuple[Recording, str]] = {}
+        self.renew_next: dict[str, float] = {}
+        self.renew_failures: dict[str, int] = {}
+        self.delivered_lock = asyncio.Lock()
+        # The renewal download in progress (extension and task) and its stop signal.
+        self.renewal: tuple[str, asyncio.Task[tuple[str, bool]]] | None = None
+        self.renewal_stop = asyncio.Event()
+        self.renewal_job = ""
+        self.renew_stops: dict[str, tuple[str, int]] = {}
+        # Set when shutdown begins: no new renewal starts.
+        self.closing = False
+        # The automatic upgrade in progress and its extension; shutdown waits for it.
+        self.upgrading: asyncio.Task[dict[str, Any]] | None = None
+        self.upgrading_extension = ""
 
     async def start(self) -> None:
         self.config.initialize()
@@ -305,20 +460,187 @@ class Service:
                     shutil.rmtree(path)
                 else:
                     path.unlink()
+        # Downloaded packages are removed after installing; leftovers are from an
+        # interrupted run. The registry cache in the same directory stays.
+        for path in (self.config.state_dir / "repo").iterdir():
+            if path.suffix.lower() in PACKAGE_SUFFIXES and (path.is_file() or path.is_symlink()):
+                path.unlink()
         self.cache = Cache(self.config)
+        self.management.load_sign_in()
+        self.sessions = self.load_state(
+            SESSIONS_FILE,
+            {
+                "expires",
+                "renewed",
+                "renewed_by",
+                "no_keep_alive",
+                "download_attempt",
+                "download_misses",
+                "no_download_renewal",
+            },
+        )
+        self.delivered = self.load_delivered() if self.renewing_by_download else {}
+        if not self.renewing_by_download:
+            (self.config.state_dir / DELIVERED_FILE).unlink(missing_ok=True)
+        self.updates = self.load_state(UPDATES_FILE, {"version", "registry", "state", "host"})
+
+    def load_state(self, name: str, keys: set[str]) -> dict[str, dict[str, Any]]:
+        try:
+            saved = json.loads((self.config.state_dir / name).read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(saved, dict):
+            return {}
+        return {
+            key: {k: v for k, v in value.items() if k in keys and isinstance(v, str)}
+            for key, value in saved.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+
+    def load_delivered(self) -> dict[str, tuple[Recording, str]]:
+        try:
+            saved = json.loads((self.config.state_dir / DELIVERED_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        result: dict[str, tuple[Recording, str]] = {}
+        for extension, entry in saved.items() if isinstance(saved, dict) else []:
+            value = entry.get("recording") if isinstance(entry, dict) else None
+            quality = entry.get("quality") if isinstance(entry, dict) else None
+            if (
+                isinstance(value, list)
+                and len(value) == 5
+                and all(isinstance(x, str) for x in value[:3] + value[4:])
+                and isinstance(value[3], int)
+                and isinstance(quality, str)
+            ):
+                result[extension] = ((value[0], value[1], value[2], value[3], value[4]), quality)
+        return result
+
+    async def remember_delivery(self, extension: str, recording: Recording, quality: str) -> None:
+        """Remember the recording this extension last delivered (its description only),
+        when renewal by a brief download is on. Written off the event loop."""
+        if not self.renewing_by_download or self.delivered.get(extension) == (
+            recording,
+            quality,
+        ):
+            return
+        self.delivered[extension] = (recording, quality)
+        await self.save_delivered()
+
+    async def save_delivered(self) -> None:
+        async with self.delivered_lock:
+            snapshot = {
+                key: {"recording": list(value), "quality": chosen}
+                for key, (value, chosen) in self.delivered.items()
+            }
+            path = self.config.state_dir / DELIVERED_FILE
+            try:
+                if snapshot:
+                    await asyncio.to_thread(write_private_json, path, snapshot)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @property
+    def renewing_by_download(self) -> bool:
+        """Renewal by a brief download runs only with keep-alive on; only then is the last
+        delivered recording kept."""
+        return self.config.keep_alive and self.config.renew_by_download
+
+    async def forget_deliveries(self, extension: str | None = None) -> None:
+        """Forget one extension's delivered recording, or all of them."""
+        if extension is None:
+            self.delivered.clear()
+        elif self.delivered.pop(extension, None) is None:
+            return
+        await self.save_delivered()
+
+    def save_state(self, name: str, value: dict[str, Any]) -> None:
+        try:
+            write_private_json(self.config.state_dir / name, value)
+        except OSError:
+            # Only the dashboard and avoiding a repeated download depend on these files.
+            pass
+
+    def start_maintenance(self) -> None:
+        """Background checks and automatic sign-in of a serving bridge (not of one-off
+        CLI commands)."""
+        self.management.on_needs_sign_in = self.needs_sign_in
+        self.maintenance += [
+            asyncio.create_task(self._repeat(self.check_sessions, SESSION_CHECK_FIRST)),
+            asyncio.create_task(self._repeat(self.check_updates, UPDATE_CHECK_FIRST)),
+        ]
+
+    async def _repeat(self, job: Any, delay: float) -> None:
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                delay = await job()
+            except BridgeError as exc:
+                log.info("maintenance job=%s outcome=%s", job.__name__, exc.code)
+                delay = SIGN_IN_RETRY
+            except Exception:
+                # Never let one failed round stop the checks; never log native details.
+                log.info("maintenance job=%s outcome=internal_error", job.__name__)
+                delay = SIGN_IN_RETRY
+
+    def check_updates_soon(self) -> None:
+        self.maintenance = [task for task in self.maintenance if not task.done()]
+        self.maintenance.append(asyncio.create_task(self._once(self.check_updates)))
+
+    async def _once(self, job: Any) -> None:
+        try:
+            await job()
+        except Exception:
+            log.info("maintenance job=%s outcome=internal_error", job.__name__)
+
+    def begin_shutdown(self) -> None:
+        """Shutdown has begun (the stop signal): start no renewal, stop a running one."""
+        self.closing = True
+        self.renewal_stop.set()
+
+    async def stop_renewal(self, extension: str | None = None) -> None:
+        """Ask a renewal in progress (on this extension, or any) to stop, and wait for it
+        within cancel_timeout; refuse the caller if it is still running then."""
+        if not self.renewal or (extension and self.renewal[0] != extension):
+            return
+        self.renewal_stop.set()
+        task = self.renewal[1]
+        if self.renewal_job in getattr(self.worker, "gentle_waiting", ()):
+            # Its cancel went unanswered and it waits for other calls: refuse at once
+            # rather than hold the caller (and the mutation lock).
+            raise BridgeError("extension_busy", 503, 5)
+        await asyncio.wait({task}, timeout=self.config.cancel_timeout + 1)
+        if not task.done():
+            raise BridgeError("extension_busy", 503, 5)
 
     async def close(self) -> None:
+        self.begin_shutdown()
+        background = self.maintenance + list(self.sign_in_tasks.values())
+        if self.renewal:
+            background.append(self.renewal[1])
         tasks = list(self.jobs.values())
-        for task in tasks:
+        for task in [*background, *tasks]:
             task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=self.config.shutdown_timeout)
+        # An automatic upgrade is not cancelled. Background work (a renewal waiting for an
+        # unanswered cancel included), preparations and the upgrade share one
+        # shutdown_timeout, so the whole stop stays within the services' stop allowance
+        # (graceful HTTP shutdown, then this, then the worker); what is left is finished
+        # below once the worker is stopped.
+        upgrading = [self.upgrading] if self.upgrading and not self.upgrading.done() else []
+        waited = [*background, *tasks, *upgrading]
+        if waited:
+            await asyncio.wait(waited, timeout=self.config.shutdown_timeout)
+        # Kept for the next start: offers and renewals of an interrupted round.
+        self.save_state(UPDATES_FILE, self.updates)
+        self.save_sessions()
         # Kill ownership before a second cancellation can remove staging.
         await self.worker.close()
-        for task in tasks:
+        for task in [*tasks, *upgrading, *background]:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, *upgrading, *background, return_exceptions=True)
         if self.cache:
             self.cache.close()
         if self.lock_file:
@@ -451,6 +773,9 @@ class Service:
             raise remembered
         if not self.slots_free(extension):
             raise BridgeError("preparation_busy", retry_after=3)
+        if self.renewal and self.renewal[0] == extension["id"]:
+            # A preparation is never delayed by a renewal on its extension: ask it to stop.
+            self.renewal_stop.set()
         task = asyncio.create_task(self._prepare(extension, native_id, quality, key, recording))
         self.jobs[key] = task
         if recording is not None:
@@ -528,7 +853,9 @@ class Service:
                 refused = availability_refusal(result)
                 if refused:
                     if refused.code == "needs_login_or_verification":
-                        self.management.states[extension["id"]] = refused.code
+                        self.management.needs_sign_in(
+                            extension["id"], "invokeExtensionAction:checkAvailability"
+                        )
                     self.log_resolve(extension["id"], source, started, refused.code)
                     raise refused
             seconds = FOUND_SECONDS if found else MISS_SECONDS
@@ -562,6 +889,7 @@ class Service:
         assert self.cache
         job_id = "bridge-" + secrets.token_hex(16)
         self.job_ids[key] = job_id
+        started = time.monotonic()
         directory = (self.config.state_dir / "jobs" / job_id).resolve()
         directory.mkdir(mode=0o700)
         # Phase timings for the log: each phase ends when the next begins.
@@ -575,21 +903,6 @@ class Service:
             current, mark = following, now
 
         try:
-            payload: dict[str, Any] = {
-                "contract_version": 1,
-                "service": extension["id"],
-                "download_provider": extension["id"],
-                "output_dir": str(directory),
-                "filename_format": "audio",
-                "quality": quality,
-                "item_id": job_id,
-                "use_extensions": True,
-                "use_fallback": False,
-                "embed_metadata": False,
-                "embed_lyrics": False,
-                "post_processing_enabled": False,
-                "network_concurrency_limit": 3,
-            }
             catalog_track = None
             if recording is None:
                 # An extension's own track: read its details, then find and download it
@@ -599,17 +912,7 @@ class Service:
                 catalog_track = map_item(raw, "track")
                 self.job_tracks[key] = catalog_track
                 recording = catalog_recording(catalog_track, raw)
-            isrc, title, artist, duration, album = recording
-            payload |= {
-                # No source and no track ID: the planner asks the extension's
-                # checkAvailability and downloads what it found, with its context.
-                "source": "",
-                "track_name": title,
-                "artist_name": artist,
-                "album_name": album,
-                "duration_ms": duration,
-                "isrc": isrc,
-            }
+            payload = strategy_payload(extension["id"], directory, quality, job_id, recording)
             phase("native")
             result = await self.management.call(
                 "downloadByStrategy", json.dumps(payload), extension["id"]
@@ -626,12 +929,20 @@ class Service:
             if catalog_track is not None:
                 track = confirmed_catalog_track(catalog_track, recording, track)
             entry = self.cache.publish(extension["id"], native_id, quality, path, track, audio)
+            await self.remember_delivery(extension["id"], recording, quality)
             outcome = "ready"
             return entry
         except BridgeError as exc:
             outcome = exc.code
             now = time.monotonic()
-            if exc.code in {"download_timeout", "worker_timeout", "worker_restarted"}:
+            restarted_by_renewal = (
+                exc.code == "worker_restarted"
+                and getattr(self.worker, "gentle_restart_at", 0.0) >= started
+            )
+            if restarted_by_renewal:
+                # The worker restart that ended it came from a renewal's cancel: no backoff.
+                pass
+            elif exc.code in {"download_timeout", "worker_timeout", "worker_restarted"}:
                 self.remember(
                     self.backoffs,
                     key,
@@ -763,8 +1074,16 @@ class Service:
         }
         if operation not in serialized:
             return await self._execute(operation, params, private=private)
+        if self.upgrading_extension and params.get("extension") == self.upgrading_extension:
+            # Its automatic upgrade runs without the mutation lock; wait for it.
+            raise BridgeError("extension_updating", 503, 5)
         async with self.mutation_lock:
             ext = str(params.get("extension", ""))
+            if self.upgrading_extension and ext == self.upgrading_extension:
+                # Queued while the upgrade's package was downloaded: still refused.
+                raise BridgeError("extension_updating", 503, 5)
+            if ext:
+                await self.stop_renewal(ext)
             self.changing.add(ext)
             try:
                 result = await self._execute(operation, params, private=private)
@@ -800,15 +1119,14 @@ class Service:
             "remove",
             "update",
         ):
-            self.management.invalidate()
-            self.catalog.isrc_failures.pop(str(params.get("extension", "")), None)
-            ext = params.get("extension")
-            for memory in (self.misses, self.backoffs, self.failures):
-                for key in [key for key in memory if key[0] == ext]:
-                    del memory[key]
-                    self.failure_codes.pop(key, None)
-            for found in [found for found in self.resolved if found[0] == ext]:
-                del self.resolved[found]
+            self.forget(str(params.get("extension", "")))
+        if operation == "remove":
+            # A removed extension delivers nothing to renew with.
+            await self.forget_deliveries(str(params.get("extension", "")))
+        if operation in ("remove", "update"):
+            # An update installed by hand or a removal replaces any automatic one.
+            if self.updates.pop(str(params.get("extension", "")), None) is not None:
+                self.save_state(UPDATES_FILE, self.updates)
         if operation in ("disable", "remove", "update"):
             extension = params.get("extension")
             tasks = [task for key, task in self.jobs.items() if key[0] == extension]
@@ -853,22 +1171,14 @@ class Service:
         if operation == "registry.available" or (
             operation in ("install", "update") and "registry" in params
         ):
-            registry = params["registry"]
-            if registry not in await self._execute("registries.get", {}):
-                raise BridgeError("registry_not_saved", 400)
-            previous = (await self.management.execute("registry.get", {}))["registry"]
-            try:
-                await self.management.execute("registry.set", {"url": registry})
-                return await self.management.execute(
+            return await self.on_registry(
+                params["registry"],
+                self.management.execute(
                     "available" if operation == "registry.available" else operation,
                     params,
                     private=private,
-                )
-            finally:
-                if previous:
-                    await self.management.execute("registry.set", {"url": previous})
-                else:
-                    await self.management.call("clearRepoRegistryUrl")
+                ),
+            )
         if operation == "cancel":
             extension = await self.extension(params["extension"])
             return await self.cancel(
@@ -912,6 +1222,676 @@ class Service:
                 if item.get("enabled")
             }
         return await self.management.execute(operation, params, private=private)
+
+    async def on_registry(self, registry: str, work: Any) -> Any:
+        """Run native registry work with this saved registry selected, then restore the
+        prior selection (the pinned host has one active registry). Hold mutation_lock."""
+        try:
+            if registry not in await self._execute("registries.get", {}):
+                raise BridgeError("registry_not_saved", 400)
+            previous = (await self.management.execute("registry.get", {}))["registry"]
+        except BaseException:
+            work.close()
+            raise
+        try:
+            await self.management.execute("registry.set", {"url": registry})
+            return await work
+        finally:
+            if previous:
+                await self.management.execute("registry.set", {"url": previous})
+            else:
+                await self.management.call("clearRepoRegistryUrl")
+
+    def forget(self, extension: str) -> None:
+        """Drop remembered answers of an extension whose settings, sign-in or code changed."""
+        self.management.invalidate()
+        self.catalog.isrc_failures.pop(extension, None)
+        for memory in (self.misses, self.backoffs, self.failures):
+            for key in [key for key in memory if key[0] == extension]:
+                del memory[key]
+                self.failure_codes.pop(key, None)
+        for found in [found for found in self.resolved if found[0] == extension]:
+            del self.resolved[found]
+
+    def needs_sign_in(self, extension: str) -> None:
+        """An operation reported a missing sign-in: install an update that was waiting
+        for this, then try signing in automatically when that is due."""
+        if extension in self.sign_in_tasks:
+            return
+        waiting = self.config.auto_update and (
+            self.updates.get(extension, {}).get("state") == "waiting"
+        )
+        automatic = extension not in self.management.manual and (
+            time.monotonic() >= self.sign_in_next.get(extension, 0)
+        )
+        if not waiting and not automatic:
+            return
+        task = asyncio.create_task(self._after_sign_out(extension, automatic))
+        self.sign_in_tasks[extension] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self.sign_in_tasks.get(extension) is done:
+                del self.sign_in_tasks[extension]
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finished)
+
+    async def _after_sign_out(self, extension: str, automatic: bool) -> None:
+        """Try signing in automatically first. Install an update that waits for a sign-in
+        only once the extension is shown to be signed out: the automatic try needs the
+        operator, or the host has opened a challenge. A single report alone is not enough."""
+        outcome = await self.sign_in_automatically(extension) if automatic else ""
+        if not self.config.auto_update or self.updates.get(extension, {}).get("state") != "waiting":
+            return
+        if outcome != "needs_operator" and not (outcome == "" and await self.challenge(extension)):
+            return
+        try:
+            await self.update_waiting(extension)
+        except BridgeError:
+            pass
+
+    async def challenge(self, extension: str) -> bool:
+        """Whether the host shows a sign-in challenge for the extension."""
+        try:
+            async with asyncio.timeout(CHECK_TIMEOUT):
+                return bool(
+                    await self.execute("pending-auth.show", {"extension": extension}, private=True)
+                )
+        except (BridgeError, TimeoutError):
+            return False
+
+    async def sign_in_automatically(self, extension: str) -> str:
+        """Sign in again once without the operator: a signed-session extension asks the
+        host to check its saved session (the gateway may issue a new one); another
+        extension runs its declared sign-in action. Anything that asks for input or a
+        browser page is left for the sign-in page."""
+        failures = self.sign_in_failures.get(extension, 0)
+        self.sign_in_next[extension] = time.monotonic() + min(
+            SIGN_IN_RETRY * 2**failures, SIGN_IN_RETRY_MAX
+        )
+        params = {"extension": extension}
+        try:
+            async with asyncio.timeout(CHECK_TIMEOUT * 3):
+                item = await self.management.extension(extension)
+                action = login_action(item)
+                if not item.get("enabled") or extension in self.disabled:
+                    outcome = "disabled"
+                elif self.management.signed_session(extension):
+                    pending = await self.execute("pending-auth.show", params, private=True)
+                    if pending:
+                        outcome = "needs_operator"
+                    elif extension in self.management.states:
+                        # No challenge, but nothing shows the session works: the saved
+                        # session has merely not expired. Leave it for the operator.
+                        outcome = "unconfirmed"
+                    else:
+                        outcome = "signed_in"
+                elif not action:
+                    outcome = "no_automatic_sign_in"
+                else:
+                    result = await self.execute("action", params | {"action": action}, private=True)
+                    if has_action_form(result) or result_browser_url(result):
+                        outcome = "needs_operator"
+                        self.management.needs_sign_in(extension, "invokeExtensionAction:" + action)
+                    elif await self.execute("pending-auth.show", params, private=True):
+                        outcome = "needs_operator"
+                    elif extension in self.management.states:
+                        outcome = "unconfirmed"
+                    else:
+                        outcome = "signed_in"
+        except BridgeError as exc:
+            outcome = "needs_operator" if exc.code in NEEDS_AUTH else exc.code
+        except TimeoutError:
+            outcome = "timeout"
+        if outcome == "signed_in":
+            self.sign_in_failures.pop(extension, None)
+            try:
+                async with asyncio.timeout(CHECK_TIMEOUT):
+                    await self.execute("health", params)
+            except (BridgeError, TimeoutError):
+                pass
+        elif outcome in {"needs_operator", "no_automatic_sign_in", "unconfirmed"}:
+            self.management.manual.add(extension)
+        elif outcome != "disabled":
+            self.sign_in_failures[extension] = failures + 1
+        log.info("sign-in extension=%s automatic=yes outcome=%s", extension, outcome)
+        return outcome
+
+    async def check_sessions(self) -> float:
+        """Notice lapsed sign-ins before playback does: the host checks each saved
+        signed session locally and asks its gateway only when it is not usable. Then keep
+        signed-in sessions alive. Returns the delay until the next check."""
+        delay = SESSION_CHECK_SECONDS
+        for item in await self.management.installed():
+            extension = item["id"]
+            if (
+                not item.get("enabled")
+                or extension in self.disabled
+                or extension in self.changing
+                or any(key[0] == extension for key in self.jobs)
+            ):
+                continue
+            if self.management.states.get(extension) in NEEDS_AUTH:
+                self.needs_sign_in(extension)
+            elif self.management.signed_session(extension):
+                try:
+                    async with asyncio.timeout(CHECK_TIMEOUT):
+                        await self.execute(
+                            "pending-auth.show", {"extension": extension}, private=True
+                        )
+                except (BridgeError, TimeoutError):
+                    pass
+                if self.management.states.get(extension) not in NEEDS_AUTH:
+                    delay = min(delay, await self.keep_alive(item))
+        return max(60.0, delay)
+
+    def session(self, extension: str) -> tuple[bool, datetime | None] | None:
+        """Read the saved signed session and record an observed renewal: a later expiry
+        than the last one seen."""
+        manifest = installed_manifest(self.config.state_dir / "extensions", extension)
+        saved = saved_session(self.config.state_dir / "data", manifest)
+        if saved is None:
+            return None
+        held, expires = saved
+        info = self.sessions.setdefault(extension, {})
+        seen = info.get("expires")
+        current = expires.isoformat() if held and expires else None
+        if current != seen:
+            previous = parse_time(seen)
+            if current and expires and previous and expires > previous:
+                info["renewed"] = datetime.now(UTC).isoformat(timespec="seconds")
+                info.pop("renewed_by", None)
+                # Renewed by anything, a download included: misses start over.
+                self.keep_alive_misses.pop(extension, None)
+            info["expires"] = current
+            self.save_sessions()
+        return held, expires
+
+    def save_sessions(self) -> None:
+        self.save_state(SESSIONS_FILE, self.sessions)
+
+    async def keep_alive(self, item: dict[str, Any]) -> float:
+        """Make one signed request inside the renewal window of a signed-in session, so
+        the host renews it. Never a download: a one-result catalog search. Returns the
+        delay until this extension needs another look."""
+        extension = item["id"]
+        saved = self.session(extension)
+        if not self.config.keep_alive or saved is None or not saved[0] or saved[1] is None:
+            return SESSION_CHECK_SECONDS
+        expires = saved[1]
+        info = self.sessions.setdefault(extension, {})
+        version = str(item.get("version") or "")
+        if info.get("no_keep_alive") == version:
+            # Its searches do not renew the session: try a brief download instead.
+            return await self.renew_by_download(item, expires)
+        if info.get("no_keep_alive"):
+            # Another version may sign its searches.
+            del info["no_keep_alive"]
+            self.save_sessions()
+        remaining = (expires - datetime.now(UTC)).total_seconds()
+        if remaining <= KEEP_ALIVE_LATEST:
+            # Too late to renew; the next use asks the gateway again.
+            return SESSION_CHECK_SECONDS
+        if remaining > KEEP_ALIVE_WINDOW:
+            return remaining - KEEP_ALIVE_LEAD
+        wait = self.keep_alive_next.get(extension, 0) - time.monotonic()
+        if wait > 0:
+            return min(wait, remaining - KEEP_ALIVE_LATEST)
+        if not item.get("has_metadata_provider"):
+            outcome = "no_signed_request"
+            info["no_keep_alive"] = version
+        else:
+            filters = [
+                str(entry["id"])
+                for entry in (item.get("search_behavior") or {}).get("filters") or []
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+            ]
+            # The smallest answer first: one artist, else one album, else the default.
+            chosen = next(
+                (x for x in filters if "artist" in x.lower()),
+                next((x for x in filters if "album" in x.lower()), filters[0] if filters else ""),
+            )
+            options: dict[str, Any] = {"limit": 1, "offset": 0}
+            if chosen:
+                options["filter"] = chosen
+            self.keep_alive_next[extension] = time.monotonic() + KEEP_ALIVE_SPACING
+            try:
+                async with asyncio.timeout(CHECK_TIMEOUT):
+                    await self.management.raw(
+                        extension, "customSearch", [KEEP_ALIVE_QUERY, options]
+                    )
+            except (BridgeError, TimeoutError) as exc:
+                failures = self.keep_alive_failures.get(extension, 0) + 1
+                self.keep_alive_failures[extension] = failures
+                self.keep_alive_next[extension] = time.monotonic() + min(
+                    KEEP_ALIVE_RETRY * 2 ** (failures - 1), SIGN_IN_RETRY_MAX
+                )
+                code = exc.code if isinstance(exc, BridgeError) else "timeout"
+                log.info("keep-alive extension=%s outcome=%s", extension, code)
+                return SESSION_CHECK_SECONDS
+            self.keep_alive_failures.pop(extension, None)
+            after = self.session(extension)
+            if after and after[0] and after[1] and after[1] > expires:
+                outcome = "renewed"
+                self.keep_alive_misses.pop(extension, None)
+            else:
+                # Searched, yet the expiry did not move: count it for this renewal window
+                # only. A failed search above is not a miss.
+                window, misses = self.keep_alive_misses.get(extension, ("", 0))
+                misses = misses + 1 if window == expires.isoformat() else 1
+                self.keep_alive_misses[extension] = (expires.isoformat(), misses)
+                outcome = "not_renewed"
+                if misses >= KEEP_ALIVE_MISSES:
+                    outcome = "no_signed_request"
+                    info["no_keep_alive"] = version
+                    self.keep_alive_misses.pop(extension, None)
+        self.save_sessions()
+        log.info("keep-alive extension=%s outcome=%s", extension, outcome)
+        if info.get("no_keep_alive") == version:
+            # Renewal by a brief download may still fit this window: look again soon.
+            return 60.0
+        return SESSION_CHECK_SECONDS
+
+    async def renew_by_download(self, item: dict[str, Any], expires: datetime) -> float:
+        """Renew a session whose extension signs only its downloads: inside the renewal
+        window, at most once per session, start preparing the last recording this
+        extension delivered and cancel it as soon as the session is renewed or the audio
+        transfer begins. The file is never kept, published or counted as a delivery.
+        Returns the delay until this extension needs another look."""
+        extension = item["id"]
+        info = self.sessions.setdefault(extension, {})
+        version = str(item.get("version") or "")
+        if not self.config.renew_by_download:
+            return SESSION_CHECK_SECONDS
+        if info.get("no_download_renewal") not in (None, version):
+            # Another version is tried again.
+            info.pop("no_download_renewal", None)
+            info.pop("download_misses", None)
+            self.save_sessions()
+        if info.get("no_download_renewal") == version:
+            return SESSION_CHECK_SECONDS
+        now = datetime.now(UTC)
+        remaining = (expires - now).total_seconds()
+        if remaining <= KEEP_ALIVE_LATEST:
+            return SESSION_CHECK_SECONDS
+        if remaining > KEEP_ALIVE_WINDOW:
+            return remaining - KEEP_ALIVE_LEAD
+        # One attempt per expiry: a renewal by anything else (a real download) moves the
+        # expiry, which starts a new session lifetime with its own window.
+        if info.get("download_attempt") == expires.isoformat():
+            return SESSION_CHECK_SECONDS
+        if self.closing or self.renewal:
+            return SESSION_CHECK_SECONDS
+        wait = self.renew_next.get(extension, 0) - time.monotonic()
+        if wait > 0:
+            return min(wait, remaining - KEEP_ALIVE_LATEST)
+        delivered = self.delivered.get(extension)
+        if delivered is None:
+            # Nothing delivered yet: never invent or search for a recording.
+            return SESSION_CHECK_SECONDS
+        if (
+            extension in self.changing
+            or extension in self.disabled
+            or extension == self.upgrading_extension
+            or self.management.states.get(extension) in NEEDS_AUTH
+            # Not while the extension prepares a file (that renews it anyway) or while no
+            # slot is free; other extensions' preparations continue beside it.
+            or any(key[0] == extension for key in self.jobs)
+            or not self.slots_free(item)
+        ):
+            return min(300.0, remaining - KEEP_ALIVE_LATEST)
+        recording, quality = delivered
+        try:
+            quality = selected_format(item, quality)
+        except BridgeError:
+            return SESSION_CHECK_SECONDS
+        self.renewal_stop = asyncio.Event()
+        task = asyncio.create_task(self.brief_download(extension, recording, quality, expires))
+        self.renewal = (extension, task)
+        try:
+            outcome, started = await asyncio.shield(task)
+        finally:
+            if task.done() and self.renewal and self.renewal[1] is task:
+                self.renewal = None
+        used = outcome != "stopped" and (started or outcome in {"renewed", "not_renewed"})
+        if used:
+            # The host started the download: this session's one attempt is used.
+            info["download_attempt"] = expires.isoformat()
+        delay = SESSION_CHECK_SECONDS
+        if outcome == "stopped":
+            # Stopped for a preparation, a change or shutdown: tried again shortly, a few
+            # times per window at most.
+            window, stops = self.renew_stops.get(extension, ("", 0))
+            stops = stops + 1 if window == expires.isoformat() else 1
+            self.renew_stops[extension] = (expires.isoformat(), stops)
+            if stops >= RENEWAL_STOPS:
+                outcome = "stopped_too_often"
+                info["download_attempt"] = expires.isoformat()
+            else:
+                delay = 120.0
+                self.renew_next[extension] = time.monotonic() + delay
+        elif outcome == "renewed":
+            self.renew_failures.pop(extension, None)
+            info.pop("download_misses", None)
+            info["renewed_by"] = "download"
+        elif outcome == "not_renewed":
+            misses = int(info.get("download_misses") or 0) + 1
+            info["download_misses"] = str(misses)
+            if misses >= RENEWAL_MISSES:
+                outcome = "gave_up"
+                info["no_download_renewal"] = version
+        else:
+            # Not a miss. Before the host started, tried again inside this window after a
+            # short backoff; after it started, this session's attempt is used and the
+            # backoff applies to the next session's.
+            failures = self.renew_failures.get(extension, 0) + 1
+            self.renew_failures[extension] = failures
+            if used:
+                backoff = min(KEEP_ALIVE_RETRY * 2 ** (failures - 1), SIGN_IN_RETRY_MAX)
+            else:
+                backoff = min(RENEWAL_RETRY * 2 ** (failures - 1), KEEP_ALIVE_RETRY)
+                delay = backoff
+            self.renew_next[extension] = time.monotonic() + backoff
+        self.save_sessions()
+        log.info("renewal extension=%s kind=brief_download outcome=%s", extension, outcome)
+        return delay
+
+    def download_progress(self, job_id: str) -> dict[str, Any] | None:
+        progress = getattr(self.worker, "progress", None)
+        value = progress(job_id) if callable(progress) else None
+        return value if isinstance(value, dict) else None
+
+    async def brief_download(
+        self, extension: str, recording: Recording, quality: str, expires: datetime
+    ) -> tuple[str, bool]:
+        """Start the host's download of the recording in a private directory and cancel
+        it at the first sign that it did its work: a later session expiry, or the audio
+        transfer starting (the extension's signed requests come before it). Also stops
+        when asked (a preparation starts, the extension changes, shutdown). Returns the
+        outcome (renewed, not_renewed, or a failure code) and whether the host started."""
+        job_id = "bridge-renewal-" + secrets.token_hex(12)
+        self.renewal_job = job_id
+        directory = (self.config.state_dir / "jobs" / job_id).resolve()
+        try:
+            directory.mkdir(mode=0o700)
+        except OSError:
+            return "staging_failed", False
+        payload = strategy_payload(extension, directory, quality, job_id, recording)
+        # A renewal's cancel never restarts the worker while other calls run.
+        gentle = getattr(self.worker, "gentle", None)
+        if isinstance(gentle, set):
+            gentle.add(job_id)
+        # Directly to the worker: not a preparation, delivery or cache entry.
+        task = asyncio.create_task(self.worker.call("downloadByStrategy", json.dumps(payload)))
+        deadline = time.monotonic() + RENEWAL_LIMIT
+        started = reached = timed_out = stopped = False
+        try:
+            while not task.done():
+                await asyncio.wait({task}, timeout=RENEWAL_POLL)
+                later = self.management.session_expiry(extension)
+                if later is not None and later > expires:
+                    break
+                progress = self.download_progress(job_id)
+                # Started once the host reported any stage, not when the request was sent.
+                started = started or bool(progress)
+                received = (progress or {}).get("bytes_received")
+                if str((progress or {}).get("status") or "").lower() in TRANSFER_STATUSES or (
+                    isinstance(received, (int, float)) and received > 0
+                ):
+                    reached = True
+                    break
+                if self.renewal_stop.is_set():
+                    stopped = True
+                    break
+                if time.monotonic() > deadline:
+                    # Slow before the transfer (an availability check, say): not a miss.
+                    timed_out = True
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+            # The supervisor keeps the call until the native download answers its
+            # cancellation (or the worker stops); only then is the folder removed. If
+            # shutdown cancels this wait, the folder stays: the worker is killed first and
+            # the next start sweeps jobs/.
+            results = await asyncio.gather(task, return_exceptions=True)
+            shutil.rmtree(directory, ignore_errors=True)
+            if isinstance(gentle, set):
+                gentle.discard(job_id)
+        after = self.session(extension)
+        if after and after[0] and after[1] and after[1] > expires:
+            return "renewed", True
+        failure = results[0]
+        if isinstance(failure, BridgeError):
+            started = started or failure.code not in NOT_STARTED
+            if failure.code in NEEDS_AUTH and await self.installed_and_enabled(extension):
+                self.management.needs_sign_in(extension, "downloadByStrategy", failure.code)
+            return failure.code, started
+        if not isinstance(failure, BaseException) and not (
+            isinstance(failure, dict) and failure.get("success") is True
+        ):
+            code = native_error(failure).code
+            if code in NEEDS_AUTH and await self.installed_and_enabled(extension):
+                self.management.needs_sign_in(extension, "downloadByStrategy", code)
+            return code, True
+        if stopped:
+            return "stopped", started
+        if timed_out:
+            return "renewal_timeout", started
+        # The transfer began or the download finished without a renewal.
+        if reached or isinstance(failure, dict):
+            return "not_renewed", True
+        return "cancelled", started
+
+    async def installed_and_enabled(self, extension: str) -> bool:
+        if extension in self.disabled:
+            return False
+        try:
+            item = await self.management.extension(extension)
+        except BridgeError:
+            return False
+        return bool(item.get("enabled"))
+
+    def session_view(self, extension: str) -> dict[str, str] | None:
+        """What the dashboard shows about a signed session; None without one."""
+        saved = self.session(extension)
+        if saved is None:
+            return None
+        info = self.sessions.get(extension, {})
+        if not self.config.keep_alive:
+            keep_alive = "off"
+        elif not info.get("no_keep_alive"):
+            keep_alive = "on"
+        elif self.config.renew_by_download and not info.get("no_download_renewal"):
+            keep_alive = "download" if extension in self.delivered else "download_later"
+        else:
+            keep_alive = "none"
+        return {
+            "expires": info.get("expires") or "",
+            "renewed": info.get("renewed") or "",
+            "renewed_by": info.get("renewed_by") or "",
+            "keep_alive": keep_alive,
+        }
+
+    async def check_updates(self) -> float:
+        """Install offered updates one extension at a time, when automatic updates are on."""
+        if not self.config.auto_update:
+            return UPDATE_CHECK_SECONDS
+        async with self.update_lock:
+            offers: dict[str, tuple[str, str]] = {}
+            for registry in await self.execute("registries.get", {}):
+                try:
+                    entries = await self.execute(
+                        "registry.available", {"registry": registry, "refresh": True}
+                    )
+                except BridgeError:
+                    continue
+                for entry in entries:
+                    if entry.get("is_installed") and entry.get("has_update"):
+                        offers.setdefault(
+                            str(entry["id"]), (registry, str(entry.get("version") or ""))
+                        )
+            for extension in [key for key in self.updates if key not in offers]:
+                del self.updates[extension]
+            busy = False
+            for extension, (registry, version) in offers.items():
+                known = self.updates.get(extension, {})
+                if known.get("version") == version and (
+                    (known.get("state") == "unsupported" and known.get("host") == HOST_ID)
+                    or (known.get("state") == "waiting" and not self.config.update_all)
+                ):
+                    # Already downloaded and found to sign the extension out: it waits
+                    # for a confirmed sign-out, not for this check.
+                    continue
+                self.updates[extension] = {
+                    "version": version,
+                    "registry": registry,
+                    "state": "available",
+                }
+                state = await self._update(extension, sign_out=self.config.update_all)
+                busy |= state == "busy"
+            self.save_state(UPDATES_FILE, self.updates)
+        return UPDATE_BUSY_RETRY if busy else UPDATE_CHECK_SECONDS
+
+    async def update_waiting(self, extension: str) -> bool:
+        """Install an update that waited for this extension to be signed out; callers
+        have established that it is (or the operator asked for it)."""
+        if not self.config.auto_update or self.updates.get(extension, {}).get("state") != "waiting":
+            return False
+        async with self.update_lock:
+            if self.updates.get(extension, {}).get("state") != "waiting":
+                return False
+            installed = await self._update(extension, sign_out=True) == "installed"
+            self.save_state(UPDATES_FILE, self.updates)
+            return installed
+
+    async def auto_update(
+        self, extension: str, registry: str, version: str, *, sign_out: bool
+    ) -> dict[str, Any]:
+        """Download the offered package and install it when it keeps the sign-in, or when
+        sign_out allows it, and only when the pinned host can load it and it is still the
+        offered, newer version. Never while the extension prepares a file; preparations
+        of other extensions continue, and the native upgrade runs without the mutation
+        lock, pausing only this extension."""
+        result: dict[str, Any] = {"installed": False, "keeps_sign_in": False, "version": version}
+        if any(key[0] == extension for key in self.jobs):
+            return result | {"busy": True}
+
+        async def fetch() -> Path | None:
+            # The registry must still offer exactly this version as an update.
+            entries = await self.management.execute("available", {"refresh": True})
+            current: dict[str, Any] = next((x for x in entries if x.get("id") == extension), {})
+            if not current.get("has_update") or str(current.get("version") or "") != version:
+                return None
+            return await self.management.download(extension)
+
+        async with self.mutation_lock:
+            package = await self.on_registry(registry, fetch())
+            if package is None:
+                return result | {"stale": True}
+            handed_over = False
+            try:
+                offered = package_manifest(package)
+                installed = installed_manifest(self.config.state_dir / "extensions", extension)
+                result["keeps_sign_in"] = keeps = keeps_sign_in(installed, offered)
+                if str(offered.get("version") or "") != version or not newer(
+                    version, str(installed.get("version") or "")
+                ):
+                    # A stale offer: never reinstall, downgrade or install another version.
+                    return result | {"stale": True}
+                if not host_accepts(offered):
+                    return result | {"unsupported": True}
+                if not keeps and not sign_out:
+                    return result
+                if any(key[0] == extension for key in self.jobs):
+                    return result | {"busy": True}
+                try:
+                    await self.stop_renewal(extension)
+                except BridgeError:
+                    # A renewal on it did not stop in time: like a preparation, it waits.
+                    return result | {"busy": True}
+                self.changing.add(extension)
+                self.upgrading_extension = extension
+                handed_over = True
+            finally:
+                if not handed_over:
+                    package.unlink(missing_ok=True)
+            # The upgrade runs as its own task: cancelling this caller (shutdown of the
+            # checks) never interrupts it, and close() waits for it.
+            self.upgrading = asyncio.create_task(self._upgrade(extension, package, result))
+            self.upgrading.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+        return await asyncio.shield(self.upgrading)
+
+    async def _upgrade(
+        self, extension: str, package: Path, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            answer = await self.management.call(
+                "upgradeExtension", {"file_path": str(package)}, extension
+            )
+            version = answer.get("version") if isinstance(answer, dict) else None
+            return result | {"installed": True, "version": str(version or result["version"])}
+        finally:
+            package.unlink(missing_ok=True)
+            self.forget(extension)
+            self.generations[extension] = self.generations.get(extension, 0) + 1
+            self.changing.discard(extension)
+            self.upgrading_extension = ""
+
+    async def _update(self, extension: str, *, sign_out: bool) -> str:
+        offer = self.updates[extension]
+        previous = offer.get("state")
+        try:
+            result = await self.auto_update(
+                extension, offer["registry"], offer["version"], sign_out=sign_out
+            )
+        except BridgeError as exc:
+            offer["state"] = "failed"
+            log.info("update extension=%s outcome=%s", extension, exc.code)
+            return "failed"
+        if result.get("stale"):
+            # The registry no longer offers this version: looked at again next check.
+            del self.updates[extension]
+            log.info("update extension=%s outcome=stale", extension)
+            return "stale"
+        if result.get("busy"):
+            # A waiting offer keeps waiting; it is tried again once preparations end.
+            state = "waiting" if previous == "waiting" else "busy"
+        elif result.get("unsupported"):
+            state = "unsupported"
+            # Looked at again when the bridge's pinned host changes.
+            offer["host"] = HOST_ID
+        elif not result.get("installed"):
+            state = "waiting"
+        else:
+            state = "installed"
+            offer["version"] = str(result.get("version") or offer["version"])
+            self.health_after_update(extension)
+        offer["state"] = state
+        log.info(
+            "update extension=%s keeps_sign_in=%s outcome=%s",
+            extension,
+            "yes" if result.get("keeps_sign_in") else "no",
+            state,
+        )
+        return state
+
+    def health_after_update(self, extension: str) -> None:
+        async def recheck() -> None:
+            params = {"extension": extension}
+            try:
+                async with asyncio.timeout(CHECK_TIMEOUT):
+                    await self.execute("health", params)
+                    if self.management.signed_session(extension):
+                        await self.execute("pending-auth.show", params, private=True)
+            except (BridgeError, TimeoutError):
+                pass
+
+        self.maintenance = [task for task in self.maintenance if not task.done()]
+        self.maintenance.append(asyncio.create_task(recheck()))
 
     def prepare_wanted(
         self, extension: dict[str, Any], wanted: Mapping[str, str], quality: str

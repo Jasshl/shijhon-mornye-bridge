@@ -20,6 +20,10 @@ still preparing answers 503 with `Retry-After: 2` while preparation continues, s
 Shijhon can ask again within that time. Use `capacity_group` when extensions share
 upstream capacity or authentication, following their documentation.
 
+When an extension needs signing in, its add-on answers 503 `needs_sign_in`. Set
+`management_public_url` to the address you open the management page at, and the answer
+also carries that page's sign-in address, so Shijhon can link to it.
+
 Each extension has a stable `mornye.EXTENSION` manifest ID. Metadata extensions declare
 `search`, `catalog`, `fullcatalog`; audio extensions declare `search`, `stream`,
 `availability`, `cached`, `resolve`. Mixed extensions declare both. Shijhon finds a

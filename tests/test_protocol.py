@@ -8,6 +8,7 @@ import httpx
 import pytest
 from conftest import EXT, TRACK, FakeWorker
 
+from mornye_bridge.catalog import map_item
 from mornye_bridge.errors import BridgeError, native_error
 from mornye_bridge.ids import decode_id, encode_id
 from mornye_bridge.server import create_app
@@ -342,3 +343,99 @@ def test_native_auth_error_is_safe_and_unavailable(code) -> None:
     )
     assert error.status == 503
     assert str(error) == "needs_login_or_verification"
+
+
+JOINED = "Invented Artist, Other Invented Artist"
+
+
+def test_display_credit_with_one_artist_id_keeps_the_reference_unnamed() -> None:
+    """A display credit beside a single artist ID may join several artists: the credit is
+    the answer's artist and the ID a reference without a name, never the joined text as one
+    artist's name. A real list of artists stays as it is."""
+    for kind, raw in (
+        ("track", TRACK | {"artists": JOINED}),
+        ("album", {"id": "album:one", "name": "Invented Album", "artists": JOINED}),
+    ):
+        mapped = map_item(raw | {"artist_id": "artist:one"}, kind)
+        assert mapped["artist"] == JOINED
+        assert mapped["artists"] == [{"id": encode_id("artist:one")}]
+    single = map_item(TRACK, "track")
+    assert single["artist"] == "Invented Artist"
+    assert single["artists"] == [{"id": encode_id("artist:one")}]
+    listed = map_item(
+        TRACK
+        | {
+            "artists": [
+                {"id": "artist:one", "name": "Invented Artist"},
+                {"id": "artist:two", "name": "Other Invented Artist"},
+            ]
+        },
+        "track",
+    )
+    assert listed["artist"] == JOINED
+    assert listed["artists"] == [
+        {"id": encode_id("artist:one"), "name": "Invented Artist"},
+        {"id": encode_id("artist:two"), "name": "Other Invented Artist"},
+    ]
+    assert "artists" not in map_item(TRACK | {"artist_id": ""}, "track")
+    assert Service.matches(
+        map_item(TRACK | {"artists": JOINED}, "track"),
+        {"title": "Invented Song", "artist": "Other Invented Artist", "durationMs": "1000"},
+    )
+
+
+async def test_joined_credit_answers_and_artist_navigation(config) -> None:
+    """Search, track, album and artist answers give a joined credit as text with the
+    artist's reference, which still opens the artist."""
+
+    class Joined(FakeWorker):
+        async def call(self, method, args=None):
+            result = await super().call(method, args)
+            if method == "invokeExtensionAction":
+                return joined(result)
+            return result
+
+    def joined(value):
+        if isinstance(value, list):
+            return [joined(v) for v in value]
+        if isinstance(value, dict):
+            value = {k: joined(v) for k, v in value.items()}
+            if value.get("artists") == "Invented Artist":
+                value["artists"] = JOINED
+            return value
+        return value
+
+    service = Service(config, Joined())
+    app = create_app(service)
+    reference = [{"id": encode_id("artist:one")}]
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://bridge"
+        ) as client:
+            base = f"/addons/{service.access_token}/invented"
+            searched = (await client.get(base + "/search", params={"q": "Invented"})).json()
+            track = searched["tracks"][0]
+            assert track["artist"] == JOINED and track["artists"] == reference
+            song = (await client.get(base + "/catalog/track/" + encode_id(TRACK["id"]))).json()
+            assert song["artist"] == JOINED and song["artists"] == reference
+            album = (await client.get(base + "/album/" + encode_id("album:one"))).json()
+            assert album["tracks"][0]["artists"] == reference
+            artist = await client.get(base + "/artist/" + track["artists"][0]["id"])
+            assert artist.status_code == 200
+            assert artist.json()["name"] == "Invented Artist"
+            assert artist.json()["topTracks"][0]["artists"] == reference
+
+
+def test_comma_joined_artist_ids_name_each_artist_when_the_counts_match() -> None:
+    track = TRACK | {"artists": "Ash Vane, Bell Orrin", "artist_id": "x:1,x:2"}
+    assert map_item(track, "track")["artists"] == [
+        {"id": encode_id("x:1"), "name": "Ash Vane"},
+        {"id": encode_id("x:2"), "name": "Bell Orrin"},
+    ]
+    # A name with a comma in it, or a single id: the reference alone, never a name.
+    odd = map_item(TRACK | {"artists": "Wren, The Hollow", "artist_id": "x:1"}, "track")
+    assert odd["artists"] == [{"id": encode_id("x:1")}]
+    mixed = map_item(
+        TRACK | {"artists": "Wren, The Hollow, Ash Vane", "artist_id": "x:1,x:2"}, "track"
+    )
+    assert mixed["artists"] == [{"id": encode_id("x:1,x:2")}]

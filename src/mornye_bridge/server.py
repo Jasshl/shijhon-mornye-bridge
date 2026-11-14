@@ -14,6 +14,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from .errors import BridgeError
 from .ids import RECORDING_PREFIX, SINGLE_PREFIX, decode_id, internal_id, single_track_id
+from .management import NEEDS_AUTH
 from .service import Service, manifest, selected_format
 from .web import Web
 
@@ -25,6 +26,7 @@ def create_app(
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         if manage_lifespan:
             await service.start()
+            service.start_maintenance()
         try:
             if surface in {"all", "management"}:
                 web.auth.start()
@@ -187,7 +189,14 @@ def create_app(
         headers = {"Cache-Control": "no-store"}
         if exc.retry_after is not None:
             headers["Retry-After"] = str(exc.retry_after)
-        return JSONResponse({"error": exc.code}, status_code=status, headers=headers)
+        body: dict[str, str] = {"error": exc.code}
+        if exc.code in NEEDS_AUTH and request.url.path.startswith(("/addons/", "/audio/")):
+            # Shijhon's protocol: the operator signs in on the bridge's own page.
+            status = 503
+            body = {"error": "needs_sign_in"}
+            if service.config.management_public_url:
+                body["url"] = service.config.management_public_url + "/sign-in"
+        return JSONResponse(body, status_code=status, headers=headers)
 
     web = Web(service)
     app = Starlette(

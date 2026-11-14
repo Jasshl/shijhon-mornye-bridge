@@ -17,8 +17,9 @@ from starlette.templating import Jinja2Templates
 
 from .config import CatalogConfig
 from .errors import BridgeError
-from .management import PASSING
-from .service import Service, manifest, selected_format
+from .management import NEEDS_AUTH, PASSING, browser_url, result_browser_url
+from .service import CHECK_TIMEOUT, Service, manifest, selected_format
+from .sessions import parse_time
 from .web_auth import COOKIE, BrowserAuth, Session
 from .web_forms import action_form, fields_view, parse_values, schema
 
@@ -31,34 +32,23 @@ HEADERS = {
     "base-uri 'none'; frame-ancestors 'none'",
     "X-Frame-Options": "DENY",
 }
-NEEDS_AUTH = {
-    "needs_login_or_verification",
-    "needs_login",
-    "unauthorized",
-    "auth_required",
-    "verification_required",
-    "needs_verification",
-}
+NEEDS_LABEL = "Needs login or verification"
+
+
+def when(value: str) -> str:
+    """An ISO time as the page shows it, in UTC."""
+    parsed = parse_time(value)
+    return parsed.strftime("%Y-%m-%d %H:%M UTC") if parsed else ""
 
 
 def status_label(status: str) -> str:
     if status.lower() in PASSING:
         return "Ready"
     if status.lower() in NEEDS_AUTH:
-        return "Needs login or verification"
+        return NEEDS_LABEL
     if status in {"unknown", "unchecked", ""}:
         return "Not checked"
     return "Unhealthy"
-
-
-def browser_url(value: Any) -> str:
-    if isinstance(value, str):
-        if len(value) > 16384 or any(ord(character) < 32 for character in value):
-            return ""
-        parsed = urlsplit(value)
-        if parsed.scheme in {"https", "http"} and parsed.hostname and not parsed.username:
-            return value
-    return ""
 
 
 class Web:
@@ -75,6 +65,8 @@ class Web:
             Route("/links", self.handle, methods=["GET"]),
             Route("/extensions/{extension}", self.handle, methods=["GET", "POST"]),
             Route("/extensions/{extension}/open-auth", self.handle, methods=["GET"]),
+            Route("/sign-in", self.handle, methods=["GET", "POST"]),
+            Route("/sign-in/{extension}", self.handle, methods=["GET"]),
             Route("/assets/{asset}", self.asset, methods=["GET"]),
         ]
 
@@ -181,6 +173,8 @@ class Web:
                     samesite="strict",
                 )
                 return response
+            elif request.url.path.startswith("/sign-in"):
+                response = await self.sign_in(request, session, data)
             elif "extension" in request.path_params:
                 response = await self.extension(request, session, data)
             elif request.method == "POST":
@@ -260,10 +254,10 @@ class Web:
             if native_status == "unsupported":
                 item = await self.service.management.extension(extension)
                 native_status = str(item.get("status", "loaded"))
-            status = status_label(self.service.management.states.get(extension) or native_status)
+            status = status_label(self.service.management.state(extension) or native_status)
         except (BridgeError, TimeoutError):
-            status = status_label(self.service.management.states.get(extension, "unhealthy"))
-        if extension not in self.service.management.states:
+            status = status_label(self.service.management.state(extension, "unhealthy"))
+        if not self.service.management.state(extension):
             # A remembered failure is not cached: a login or passing check clears it.
             self.health_cache[extension] = (time.monotonic() + 60, status)
         return status
@@ -321,6 +315,23 @@ class Web:
                 )
             except BridgeError:
                 errors.append(registry)
+        for item in installed:
+            offer = next(
+                (x for x in available if x["id"] == item["id"] and x.get("has_update")), None
+            )
+            if offer:
+                known = self.service.updates.get(item["id"], {})
+                state = known.get("state") if known.get("version") == offer.get("version") else ""
+                item["offer"] = {
+                    "version": offer.get("version"),
+                    "registry": offer["registry"],
+                    "state": state or "available",
+                }
+            if signed := self.service.session_view(item["id"]):
+                item["session"] = {
+                    key: when(value) if key in {"expires", "renewed"} else value
+                    for key, value in signed.items()
+                }
         return self.render(
             request,
             session,
@@ -338,6 +349,13 @@ class Web:
             else "private",
             budget_seconds=max(30, int(self.service.config.stream_wait + 2)),
             stream_wait=self.service.config.stream_wait,
+            sign_in_needed=[
+                item for item in installed if item["enabled"] and item["status"] == NEEDS_LABEL
+            ],
+            auto_update=self.service.config.auto_update,
+            update_all=self.service.config.update_all,
+            keep_alive=self.service.config.keep_alive,
+            renew_by_download=self.service.config.renew_by_download,
         )
 
     async def dashboard_post(self, session: Session, data: dict[str, str]) -> Response:
@@ -351,6 +369,23 @@ class Web:
                 urls = [value for value in urls if value != url]
             await self.service.execute("registries.save", {"urls": urls})
             self.registry_cache.clear()
+        elif operation == "updates.save":
+            self.service.config.persist(
+                auto_update=data.get("auto_update") == "yes",
+                update_all=data.get("update_all") == "yes",
+            )
+        elif operation == "sessions.save":
+            self.service.config.persist(
+                keep_alive=data.get("keep_alive") == "yes",
+                renew_by_download=data.get("renew_by_download") == "yes",
+            )
+            if not self.service.renewing_by_download:
+                # Nothing is kept for a renewal that is switched off.
+                await self.service.forget_deliveries()
+        elif operation == "updates.check":
+            self.service.check_updates_soon()
+            session.notice = "Checking for updates in the background. Refresh in a minute."
+            return self.redirect("/#updates")
         elif operation == "refresh":
             self.service.management.invalidate()
             self.registry_cache.clear()
@@ -386,21 +421,8 @@ class Web:
             )
         else:
             session.forms.pop(extension, None)
-        payload = result.get("result", result) if isinstance(result, dict) else {}
-        if isinstance(payload, dict):
-            urls = [payload.get(key) for key in ("auth_url", "login_url", "url")]
-            updates = payload.get("setting_updates") or {}
-            if isinstance(updates, dict):
-                urls += [
-                    value
-                    for key, value in updates.items()
-                    if "url" in key.lower()
-                    and any(word in key.lower() for word in ("auth", "login"))
-                ]
-            for value in urls:
-                if url := browser_url(value):
-                    session.auth_urls[extension] = (time.monotonic() + 180, url)
-                    break
+        if url := result_browser_url(result):
+            session.auth_urls[extension] = (time.monotonic() + 180, url)
 
     async def retry(self, session: Session, extension: str) -> None:
         self.health_cache.pop(extension, None)
@@ -415,6 +437,151 @@ class Web:
             status = await self.extension_status(extension, refresh=True)
             session.notice = "Return submitted. " + status + ". Retry playback in Shijhon."
 
+    def current_form(self, session: Session, extension: str) -> dict[str, Any] | None:
+        form = session.forms.get(extension)
+        if form and form["expires"] <= time.monotonic():
+            session.forms.pop(extension, None)
+            form = None
+        return form
+
+    async def login_view(
+        self,
+        session: Session,
+        extension: str,
+        fields: list[dict[str, Any]],
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The extension's current login step: an action form, a pending challenge and
+        whether a browser link can be opened. Private values never enter the view."""
+        form = self.current_form(session, extension)
+        pending = await self.pending(extension)
+        remembered = session.auth_urls.get(extension, (0, ""))
+        has_link = bool(
+            browser_url(pending.get("auth_url"))
+            or remembered[0] > time.monotonic()
+            or any(
+                browser_url(values.get(field["key"]))
+                for field in fields
+                if "url" in field["key"].lower()
+                and any(word in field["key"].lower() for word in ("auth", "login"))
+            )
+        )
+        return {
+            "action_form": form,
+            "action_fields": fields_view(form["fields"], {}, transient=True) if form else [],
+            "pending": bool(pending),
+            "has_link": has_link,
+        }
+
+    def needs_sign_in(self, extension: str) -> bool:
+        return self.service.management.states.get(extension) in NEEDS_AUTH
+
+    async def recheck(self, extension: str) -> str:
+        """Check an extension's sign-in again: the host's pending-auth check (which for a
+        signed session also confirms a usable one), then its status."""
+        self.health_cache.pop(extension, None)
+        try:
+            async with asyncio.timeout(CHECK_TIMEOUT):
+                await self.pending(extension)
+        except (BridgeError, TimeoutError):
+            pass
+        return await self.extension_status(extension, refresh=True)
+
+    def signed_in_notice(self, session: Session, name: str, status: str) -> None:
+        if status == "Ready" and name not in session.completed:
+            session.completed = [*session.completed, name][-32:]
+        session.notice = f"{name}: {status}."
+
+    async def sign_in(self, request: Request, session: Session, data: dict[str, str]) -> Response:
+        """One page for every extension that needs signing in, walked through in turn."""
+        management = self.service.management
+        if "extension" in request.path_params:
+            extension = request.path_params["extension"]
+            item = await management.extension(extension)
+            name = item.get("display_name") or extension
+            fields = schema(item)
+            values = await management.call("getExtensionSettings", {"extension_id": extension})
+            view = await self.login_view(session, extension, fields, values)
+            if (
+                not self.needs_sign_in(extension)
+                and not view["pending"]
+                and not view["action_form"]
+            ):
+                self.signed_in_notice(
+                    session, name, await self.extension_status(extension, refresh=True)
+                )
+                return self.redirect("/sign-in")
+            offer = self.service.updates.get(extension, {})
+            return self.render(
+                request,
+                session,
+                "sign_in_step.html",
+                item=item,
+                fields=fields_view(fields, values),
+                signed_session=management.signed_session(extension),
+                waiting_update=offer.get("version")
+                if self.service.config.auto_update and offer.get("state") == "waiting"
+                else "",
+                **view,
+            )
+        if request.method == "POST":
+            if data.get("operation") not in {"recheck", "update"}:
+                raise BridgeError("unknown_form_operation", 400)
+            chosen = data.get("extension", "")
+            installed = await self.service.execute("list", {})
+            names = {item["id"]: item.get("display_name") or item["id"] for item in installed}
+            if data["operation"] == "update":
+                # The operator chose to install the update that would sign this extension
+                # out before signing it in.
+                if chosen not in names:
+                    raise BridgeError("extension_not_found", 404)
+                if await self.service.update_waiting(chosen):
+                    item = await management.extension(chosen)
+                    session.notice = (
+                        f"Updated {names[chosen]} to version {item['version']}. Sign in now."
+                    )
+                else:
+                    session.notice = "The update could not be installed now. Try again later."
+                return self.redirect("/sign-in/" + quote(chosen, safe=""))
+            if chosen:
+                if chosen not in names:
+                    raise BridgeError("extension_not_found", 404)
+                status = await self.recheck(chosen)
+                self.signed_in_notice(session, names[chosen], status)
+                if status == NEEDS_LABEL:
+                    return self.redirect("/sign-in/" + quote(chosen, safe=""))
+            else:
+                waiting = [x for x in installed if x.get("enabled") and self.needs_sign_in(x["id"])]
+                statuses = await asyncio.gather(*(self.recheck(x["id"]) for x in waiting))
+                ready = [
+                    names[x["id"]]
+                    for x, status in zip(waiting, statuses, strict=True)
+                    if status != NEEDS_LABEL
+                ]
+                for name in ready:
+                    self.signed_in_notice(session, name, "Ready")
+                session.notice = "Rechecked. " + (
+                    ", ".join(ready) + " no longer need signing in."
+                    if ready
+                    else "Nothing changed."
+                )
+            return self.redirect("/sign-in")
+        installed = await self.service.execute("list", {})
+        needing = [
+            item for item in installed if item.get("enabled") and self.needs_sign_in(item["id"])
+        ]
+        for item in needing:
+            item["signed_session"] = management.signed_session(item["id"])
+            item["offer"] = self.service.updates.get(item["id"], {})
+        return self.render(
+            request,
+            session,
+            "sign_in.html",
+            needing=needing,
+            completed=session.completed,
+            auto_update=self.service.config.auto_update,
+        )
+
     async def extension(self, request: Request, session: Session, data: dict[str, str]) -> Response:
         extension = request.path_params["extension"]
         item = await self.service.management.extension(extension)
@@ -423,6 +590,10 @@ class Web:
             "getExtensionSettings", {"extension_id": extension}
         )
         base = "/extensions/" + quote(extension, safe="")
+        # Steps started from the sign-in page return there; nothing else is accepted.
+        back = (
+            "/sign-in/" + quote(extension, safe="") if data.get("return_to") == "sign-in" else base
+        )
         if request.url.path.endswith("/open-auth"):
             pending = await self.pending(extension)
             remembered = session.auth_urls.get(extension, (0, ""))
@@ -447,10 +618,7 @@ class Web:
                 url, status_code=303, headers=HEADERS | {"Referrer-Policy": "no-referrer"}
             )
         operation = data.get("operation", "")
-        form = session.forms.get(extension)
-        if form and form["expires"] <= time.monotonic():
-            session.forms.pop(extension, None)
-            form = None
+        form = self.current_form(session, extension)
         if request.method == "POST":
             try:
                 if operation == "settings":
@@ -458,6 +626,9 @@ class Web:
                     await self.service.execute(
                         "settings.set", {"extension": extension, "values": changed}
                     )
+                    # Account values may be the sign-in: the next attempt shows whether
+                    # they work, and reports a missing sign-in again if not.
+                    self.service.management.signed_in(extension)
                     session.notice = "Settings saved."
                 elif operation == "action":
                     action = data.get("action", "")
@@ -556,19 +727,8 @@ class Web:
                         retry_params,
                     )
                 session.notice = "Needs login or verification. Open the provider page below."
-            return self.redirect(base)
-        pending = await self.pending(extension)
-        remembered = session.auth_urls.get(extension, (0, ""))
-        has_link = bool(
-            browser_url(pending.get("auth_url"))
-            or remembered[0] > time.monotonic()
-            or any(
-                browser_url(values.get(field["key"]))
-                for field in fields
-                if "url" in field["key"].lower()
-                and any(word in field["key"].lower() for word in ("auth", "login"))
-            )
-        )
+            return self.redirect(back)
+        view = await self.login_view(session, extension, fields, values)
         catalog = self.service.config.catalogs.get(extension, CatalogConfig())
         catalog_key = catalog.key
         if item.get("has_metadata_provider") and catalog_key is None:
@@ -582,13 +742,8 @@ class Web:
             "extension.html",
             item=item,
             fields=fields_view(fields, values),
-            action_form=form,
-            action_fields=fields_view(form["fields"], {}, transient=True) if form else [],
-            pending=bool(pending),
-            has_link=has_link,
-            status="Needs login or verification"
-            if pending
-            else await self.extension_status(extension),
+            **view,
+            status=NEEDS_LABEL if view["pending"] else await self.extension_status(extension),
             catalog=catalog,
             catalog_key=catalog_key,
         )

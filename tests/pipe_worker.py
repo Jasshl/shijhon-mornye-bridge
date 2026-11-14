@@ -59,6 +59,9 @@ def reply(message):
         os._exit(1)
     if method == "hang":
         return
+    if method == "upgradeExtension":
+        # Slower than an ordinary call deadline in the tests.
+        threading.Event().wait(0.4)
     if method == "noisy":
         sys.stderr.write("private-token https://private.example.test/path?grant=secret\n" * 2000)
         sys.stderr.flush()

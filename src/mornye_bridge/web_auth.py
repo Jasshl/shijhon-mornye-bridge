@@ -52,6 +52,8 @@ class Session:
     forms: dict[str, dict[str, Any]] = field(default_factory=dict)
     auth_urls: dict[str, tuple[float, str]] = field(default_factory=dict)
     retries: dict[str, tuple[float, str, dict[str, Any]]] = field(default_factory=dict)
+    # Extensions signed in on the sign-in page during this browser session (names only).
+    completed: list[str] = field(default_factory=list)
     notice: str = ""
 
 
